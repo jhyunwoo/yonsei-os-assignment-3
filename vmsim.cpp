@@ -1,11 +1,3 @@
-// -----------------------------------------------------------------------------
-// Virtual Memory Simulator supporting FIFO, LRU, LFU *in their own classes*.
-// Original S3-FIFO-based VMSimulator remains essentially untouched.
-// -----------------------------------------------------------------------------
-// Build : g++ -std=c++17 -O2 -Wall -Wextra -pedantic -o vmsim vmsim.cpp
-// Usage : ./vmsim <num_frames> <tlb_size> <FIFO|LRU|LFU|S3FIFO>
-// -----------------------------------------------------------------------------
-
 #include <iostream>
 #include <iomanip>
 #include <vector>
@@ -20,20 +12,15 @@
 
 using namespace std;
 
-/* ─────────────────────── Address-size constants ─────────────────────── */
-constexpr int  PAGE_OFFSET_BITS = 12;                    // 4 KiB pages
-constexpr int  LEVEL1_BITS      = 10;
-constexpr int  LEVEL2_BITS      = 10;
-constexpr uint32_t LEVEL1_MASK  = (1u << LEVEL1_BITS) - 1;
-constexpr uint32_t LEVEL2_MASK  = (1u << LEVEL2_BITS) - 1;
-constexpr uint32_t OFFSET_MASK  = (1u << PAGE_OFFSET_BITS) - 1;
+constexpr int  PAGE_OFFSET_BITS = 12;
+constexpr int  LEVEL1_BITS = 10;
+constexpr int  LEVEL2_BITS = 10;
+constexpr uint32_t LEVEL1_MASK = (1u << LEVEL1_BITS) - 1;
+constexpr uint32_t LEVEL2_MASK = (1u << LEVEL2_BITS) - 1;
+constexpr uint32_t OFFSET_MASK = (1u << PAGE_OFFSET_BITS) - 1;
 
-/* ─────────────────────── Page-table helper ──────────────────────────── */
 struct PageTableEntry { uint32_t ppn = 0; bool valid = false; };
 
-/* -----------------------------------------------------------------------------
- *                          Original S3-FIFO structures
- * -------------------------------------------------------------------------- */
 // S3-FIFO 구조체
 template<typename T>
 class S3FIFO {
@@ -137,10 +124,14 @@ private:
         return UINT32_MAX;
     }
     void freeFrame(uint32_t frame_num){
+        if (frames[frame_num] != UINT32_MAX) {      // 실제 점유 중일 때만 감소
+        --allocated_frames;
         frames[frame_num] = UINT32_MAX;
     }
+    }
     void occupyFrame(uint32_t frame_num, uint32_t vpn){
-        frames[frame_num] = vpn;
+        if (frames[int(frame_num)] == UINT32_MAX) ++allocated_frames;
+        frames[int(frame_num)] = vpn;
     }
     
     // 통계
@@ -190,7 +181,6 @@ public:
             frame_s3fifo.access(vpn);
         } else {
             tlb_misses++;
-            
             // 페이지 테이블 확인
             if (page_table[level1_idx][level2_idx].valid) {
                 frame_num = page_table[level1_idx][level2_idx].ppn;
@@ -198,11 +188,62 @@ public:
                 // Page fault 처리
                 page_fault = true;
                 page_faults++;
-        
-                if(frame_s3fifo.small_fifo.size() >= frame_s3fifo.small_size){
+
+                if(frame_s3fifo.ghost_fifo.count(vpn)){
+                    frame_s3fifo.ghost_fifo.erase(vpn);
+                    if(frame_s3fifo.main_fifo.size() >= frame_s3fifo.main_size){
+                        uint32_t victim = frame_s3fifo.main_fifo.front();
+                        frame_s3fifo.main_fifo.pop_front();
+                        frame_s3fifo.ghost_fifo.insert(victim);
+                        frame_s3fifo.freq[victim]=0;
+                        freeFrame(vpn_to_frame[victim]);
+                        vpn_to_frame.erase(victim);
+                        frame_evicted = true;
+                        evicted_vpn = vpn_to_frame[victim];
+                    }
+                    frame_s3fifo.main_fifo.push_back(vpn);
+                    frame_s3fifo.freq[vpn]=0;
+                    vpn_to_frame[vpn] = frame_num;
+                    page_table[level1_idx][level2_idx].ppn = frame_num;
+                    page_table[level1_idx][level2_idx].valid = true;
+                    occupyFrame(frame_num, vpn);
+                    
+                } else if(frame_s3fifo.small_fifo.size() >= frame_s3fifo.small_size){
+                     if(tlb_s3fifo.small_fifo.size() >= tlb_s3fifo.small_size){
+                    uint32_t victim = tlb_s3fifo.small_fifo.front();
+                    tlb_s3fifo.small_fifo.pop_front();
+                    if(tlb_s3fifo.freq[victim] >=1){
+                        if(tlb_s3fifo.main_fifo.size() >= tlb_s3fifo.main_size){
+                            uint32_t victim = tlb_s3fifo.main_fifo.front();
+                            tlb_s3fifo.main_fifo.pop_front();
+                            tlb_map.erase(victim);
+                        }
+                        tlb_s3fifo.main_fifo.push_back(victim);
+                        tlb_s3fifo.freq[victim]=0;
+                    }else {
+                        if(tlb_s3fifo.ghost_fifo.size() >= tlb_s3fifo.ghost_size) {
+                            tlb_s3fifo.ghost_fifo.erase(tlb_s3fifo.ghost_fifo.begin());
+                        }
+                        tlb_s3fifo.ghost_fifo.insert(victim);
+                        tlb_s3fifo.freq[victim]=0;
+                       
+                        tlb_map.erase(victim);
+                    }
+                }
+                tlb_s3fifo.small_fifo.push_back(vpn);
+                tlb_s3fifo.freq[vpn]=0;
+
                     uint32_t victim = frame_s3fifo.small_fifo.front();
                     frame_s3fifo.small_fifo.pop_front();
                     if(frame_s3fifo.freq[victim] >=1){
+                        if(frame_s3fifo.main_fifo.size() >= frame_s3fifo.main_size){
+                            uint32_t victim = frame_s3fifo.main_fifo.front();
+                            frame_s3fifo.main_fifo.pop_front();
+                            freeFrame(vpn_to_frame[victim]);
+                            vpn_to_frame.erase(victim);
+                            frame_evicted = true;
+                            evicted_vpn = vpn_to_frame[victim];
+                        }
                         frame_s3fifo.main_fifo.push_back(victim);
                         frame_s3fifo.freq[victim]=0;
                     }else {
@@ -212,16 +253,33 @@ public:
                         frame_s3fifo.ghost_fifo.insert(victim);
                         frame_evicted = true;
                         evicted_vpn = vpn_to_frame[victim];
-                        freeFrame(vpn_to_frame[victim]);
+                        freeFrame(evicted_vpn);
                         vpn_to_frame.erase(victim);
                     }
                 }
+
                 
                 // 프레임이 모두 사용 중인지 확인
                 if (allocated_frames < num_frames && !frame_evicted) {
+                    
                     // 새 프레임 할당
                     frame_num =findFreeFrame();
-                    occupyFrame(frame_num, frame_num);
+                     if(frame_num == UINT32_MAX){
+                        cout << "Frame num is UINT32_MAX" << endl;
+                        // print all free frames
+                        cout << "Free frames: ";
+                        for(auto &item : frames) {
+                            cout << item << " ";
+                        }
+                        cout << endl;
+                        // print all vpn_to_frame
+                        cout << "VPN to frame: ";
+                        for(auto &item : vpn_to_frame) {
+                            cout << item.first << " -> " << item.second << " ";
+                        }
+                        cout << endl;
+                     }
+                    occupyFrame(frame_num, vpn);
                     frame_s3fifo.insert(vpn);
                 } else {
                     // 프레임 교체 필요
@@ -229,18 +287,13 @@ public:
                         // evicted VPN이 사용하던 프레임 찾기
                         frame_num = findFreeFrame();
                         
-                        // 이전 매핑 제거
-                        uint32_t ev_l1 = (evicted_vpn >> LEVEL2_BITS) & LEVEL1_MASK;
-                        uint32_t ev_l2 = evicted_vpn & LEVEL2_MASK;
-                        page_table[ev_l1][ev_l2].valid = false;
-                        
                         // TLB에서도 제거
                         tlb_map.erase(evicted_vpn);
                         vpn_to_frame.erase(evicted_vpn);
                         
                         // 프레임에 새 VPN 할당
-                        occupyFrame(frame_num, frame_num);
-                    
+                        occupyFrame(frame_num, vpn);
+                        
                 }
                 
                 // 새 매핑 설정
@@ -253,6 +306,11 @@ public:
             auto [tlb_evicted, evicted_tlb_vpn] = tlb_s3fifo.insert(vpn);
             if (tlb_evicted) {
                 tlb_map.erase(evicted_tlb_vpn);
+                freeFrame(vpn_to_frame[evicted_tlb_vpn]);
+                vpn_to_frame.erase(evicted_tlb_vpn);
+                uint32_t v1 = (evicted_tlb_vpn >> LEVEL2_BITS) & LEVEL1_MASK;
+                uint32_t v2 =  evicted_tlb_vpn & LEVEL2_MASK;
+                page_table[v1][v2].valid = false; 
             }
             tlb_map[vpn] = frame_num;
         }
@@ -292,7 +350,6 @@ static inline void print_hex32(uint32_t v)
 }
 
 
-/* ───────────────────── Replacement‑policy classes ─────────────────── */
 namespace policy {
 
 struct FIFO {
@@ -367,27 +424,21 @@ private:
     uint32_t counter;
 };
 
-} // namespace policy
-
-
-/* ───────────────────── Generic VM simulator ───────────────────── */
+}
 
 template<typename Policy>
 class BasicSimulator {
 public:
     BasicSimulator(int nframes, int tlbsz)
-        : pt(1 << LEVEL1_BITS, vector<PageTableEntry>(1 << LEVEL2_BITS))
-        , tlb(tlbsz)
-        , frame(nframes)
-        , frames(nframes, UINT32_MAX) {}
+        : pt(1 << LEVEL1_BITS, vector<PageTableEntry>(1 << LEVEL2_BITS)), tlb(tlbsz), frame(nframes), frames(nframes, UINT32_MAX) {}
 
     void access_memory(uint32_t vaddr)
     {
         ++refs;
         uint32_t vpn = vaddr >> PAGE_OFFSET_BITS;
         uint32_t off = vaddr & OFFSET_MASK;
-        uint32_t l1  = (vpn >> LEVEL2_BITS) & LEVEL1_MASK;
-        uint32_t l2  =  vpn & LEVEL2_MASK;
+        uint32_t l1 = (vpn >> LEVEL2_BITS) & LEVEL1_MASK;
+        uint32_t l2 =  vpn & LEVEL2_MASK;
 
         bool tlb_hit = tlb.access(vpn);
         uint32_t pfn = 0; bool pg = false; bool ev = false; uint32_t vic = 0;
@@ -427,17 +478,16 @@ public:
     void print_statistics() const
     {
         cout << "Total references: " << refs << '\n'
-             << "TLB hits: "        << tlb_hits << '\n'
-             << "TLB misses: "      << tlb_miss << '\n'
-             << "TLB hit ratio: "   << fixed << setprecision(1)
+             << "TLB hits: " << tlb_hits << '\n'
+             << "TLB misses: " << tlb_miss << '\n'
+             << "TLB hit ratio: " << fixed << setprecision(1)
              << (refs ? tlb_hits * 100.0 / refs : 0.0) << "%\n"
-             << "Page faults: "     << page_faults << '\n'
+             << "Page faults: " << page_faults << '\n'
              << "Page fault rate: " << fixed << setprecision(1)
              << (refs ? page_faults * 100.0 / refs : 0.0) << "%\n";
     }
 
 private:
-    /* helpers */
     size_t find_free_frame() const {
         for (size_t i = 0; i < frames.size(); ++i)
             if (frames[i] == UINT32_MAX) return i;
@@ -453,13 +503,11 @@ private:
         pt[e1][e2].valid = false; tlb_map.erase(victim);
     }
 
-    /* structures */
     vector<vector<PageTableEntry>> pt;
     Policy tlb, frame;
     unordered_map<uint32_t, uint32_t> tlb_map, vpn2frame;
     vector<uint32_t> frames;
 
-    /* stats */
     uint64_t refs = 0, tlb_hits = 0, tlb_miss = 0, page_faults = 0;
 };
 
@@ -467,9 +515,6 @@ using FIFOSim = BasicSimulator<policy::FIFO>;
 using LRUSim  = BasicSimulator<policy::LRU>;
 using LFUSim  = BasicSimulator<policy::LFU>;
 
-/* -----------------------------------------------------------------------------
- *                                   main
- * -------------------------------------------------------------------------- */
 int main(int argc, char *argv[])
 {
     if (argc != 4) {

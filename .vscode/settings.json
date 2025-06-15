@@ -34,6 +34,11 @@
     "unordered_set": "cpp",
     "utility": "cpp",
     "variant": "cpp",
-    "vector": "cpp"
+    "vector": "cpp",
+    "__hash_table": "cpp",
+    "__split_buffer": "cpp",
+    "bitset": "cpp",
+    "initializer_list": "cpp",
+    "list": "cpp"
   }
 }
