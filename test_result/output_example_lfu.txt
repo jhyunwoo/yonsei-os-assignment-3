@@ -1,0 +1,26 @@
+0x00000000 -> 0x00000000, TLB miss, Page fault
+0x00000800 -> 0x00000800, TLB hit, No page fault
+0x00001179 -> 0x00001179, TLB miss, Page fault
+0x00001979 -> 0x00001979, TLB hit, No page fault
+0x00002265 -> 0x00002265, TLB miss, Page fault
+0x00002A65 -> 0x00002A65, TLB hit, No page fault
+0x00003612 -> 0x00003612, TLB miss, Page fault
+0x00003E12 -> 0x00003E12, TLB hit, No page fault
+0x0000495A -> 0x0000495A, TLB miss, Page fault
+0x0000515A -> 0x0000515A, TLB miss, Page fault
+0x00005B25 -> 0x00005B25, TLB hit, No page fault
+0x00006325 -> 0x00006325, TLB miss, Page fault
+0x00006B86 -> 0x00006B86, TLB hit, No page fault
+0x00007386 -> 0x00007386, TLB miss, Page fault
+0x00007E46 -> 0x00007E46, TLB hit, No page fault
+0x00008646 -> 0x00008646, TLB miss, Page fault
+0x00009057 -> 0x00009057, TLB miss, Page fault
+0x00009857 -> 0x00009857, TLB hit, No page fault
+0x0000A287 -> 0x00004287, TLB miss, Page fault, Evicted 0x00004000
+0x0000AA87 -> 0x00004A87, TLB hit, No page fault
+Total references: 20
+TLB hits: 9
+TLB misses: 11
+TLB hit ratio: 45.0%
+Page faults: 11
+Page fault rate: 55.0%

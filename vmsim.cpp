@@ -1,39 +1,39 @@
+// -----------------------------------------------------------------------------
+// Virtual Memory Simulator supporting FIFO, LRU, LFU *in their own classes*.
+// Original S3-FIFO-based VMSimulator remains essentially untouched.
+// -----------------------------------------------------------------------------
+// Build : g++ -std=c++17 -O2 -Wall -Wextra -pedantic -o vmsim vmsim.cpp
+// Usage : ./vmsim <num_frames> <tlb_size> <FIFO|LRU|LFU|S3FIFO>
+// -----------------------------------------------------------------------------
+
 #include <iostream>
 #include <iomanip>
 #include <vector>
 #include <deque>
+#include <list>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
 #include <cstdint>
 #include <algorithm>
+#include <memory>
 
 using namespace std;
 
-// 페이지 크기와 관련 상수
-const int PAGE_OFFSET_BITS = 12;
-const int PAGE_SIZE = 1 << PAGE_OFFSET_BITS; // 4KB
-const int LEVEL1_BITS = 10;
-const int LEVEL2_BITS = 10;
-const uint32_t LEVEL1_MASK = (1 << LEVEL1_BITS) - 1;
-const uint32_t LEVEL2_MASK = (1 << LEVEL2_BITS) - 1;
-const uint32_t OFFSET_MASK = (1 << PAGE_OFFSET_BITS) - 1;
+/* ─────────────────────── Address-size constants ─────────────────────── */
+constexpr int  PAGE_OFFSET_BITS = 12;                    // 4 KiB pages
+constexpr int  LEVEL1_BITS      = 10;
+constexpr int  LEVEL2_BITS      = 10;
+constexpr uint32_t LEVEL1_MASK  = (1u << LEVEL1_BITS) - 1;
+constexpr uint32_t LEVEL2_MASK  = (1u << LEVEL2_BITS) - 1;
+constexpr uint32_t OFFSET_MASK  = (1u << PAGE_OFFSET_BITS) - 1;
 
-// TLB 엔트리
-struct TLBEntry {
-    uint32_t vpn;  // Virtual Page Number
-    uint32_t ppn;  // Physical Page Number
-    bool valid;
-    TLBEntry() : vpn(0), ppn(0), valid(false) {}
-};
+/* ─────────────────────── Page-table helper ──────────────────────────── */
+struct PageTableEntry { uint32_t ppn = 0; bool valid = false; };
 
-// 페이지 테이블 엔트리
-struct PageTableEntry {
-    uint32_t ppn;
-    bool valid;
-    PageTableEntry() : ppn(0), valid(false) {}
-};
-
+/* -----------------------------------------------------------------------------
+ *                          Original S3-FIFO structures
+ * -------------------------------------------------------------------------- */
 // S3-FIFO 구조체
 template<typename T>
 class S3FIFO {
@@ -129,7 +129,7 @@ private:
     unordered_map<uint32_t, uint32_t> vpn_to_frame; // VPN -> frame number
 
     uint32_t findFreeFrame(){
-        for(int i=0; i<frames.size(); i++){
+        for(size_t i=0; i<frames.size(); i++){
             if(frames[i] == UINT32_MAX){
                 return i;
             }
@@ -151,7 +151,6 @@ private:
     
     // 설정
     int num_frames;
-    int tlb_size;
     int allocated_frames;
     
 public:
@@ -165,7 +164,6 @@ public:
           tlb_misses(0),
           page_faults(0),
           num_frames(frames_count),
-          tlb_size(tlb_sz),
           allocated_frames(0) {}
     
     void access_memory(uint32_t vaddr) {
@@ -288,30 +286,227 @@ public:
     }
 };
 
-int main(int argc, char* argv[]) {
+static inline void print_hex32(uint32_t v)
+{
+    cout << "0x" << uppercase << hex << setw(8) << setfill('0') << v;
+}
+
+
+/* ───────────────────── Replacement‑policy classes ─────────────────── */
+namespace policy {
+
+struct FIFO {
+    explicit FIFO(size_t c) : cap(c) {}
+    bool access(uint32_t k) { return idx.count(k); }
+    pair<bool, uint32_t> insert(uint32_t k) {
+        if (idx.count(k)) return {false, 0};
+        bool ev = false; uint32_t vic = 0;
+        if (q.size() >= cap) { vic = q.front(); q.pop_front(); idx.erase(vic); ev = true; }
+        q.push_back(k); idx[k] = true; return {ev, vic};
+    }
+    void touch(uint32_t) {}
+private:
+    size_t cap; deque<uint32_t> q; unordered_map<uint32_t, bool> idx;
+};
+
+struct LRU {
+    explicit LRU(size_t c) : cap(c) {}
+    bool access(uint32_t k) {
+        if (!pos.count(k)) return false;
+        lst.erase(pos[k]); lst.push_back(k); pos[k] = prev(lst.end());
+        return true;
+    }
+    pair<bool, uint32_t> insert(uint32_t k) {
+        if (access(k)) return {false, 0};
+        bool ev = false; uint32_t vic = 0;
+        if (lst.size() >= cap) { vic = lst.front(); lst.pop_front(); pos.erase(vic); ev = true; }
+        lst.push_back(k); pos[k] = prev(lst.end()); return {ev, vic};
+    }
+    void touch(uint32_t k) { access(k); }
+private:
+    size_t cap; deque<uint32_t> lst; unordered_map<uint32_t, deque<uint32_t>::iterator> pos;
+};
+
+struct LFU {
+    explicit LFU(size_t c) : cap(c), counter(0) {}
+    bool access(uint32_t k) { 
+        if (!freq.count(k)) return false; 
+        ++freq[k]; 
+        return true; 
+    }
+    pair<bool, uint32_t> insert(uint32_t k) {
+        if (access(k)) return {false, 0};
+        bool ev = false; uint32_t vic = 0;
+        if (freq.size() >= cap) {
+            // Find minimum frequency
+            int min_freq = INT_MAX;
+            for (const auto& p : freq) {
+                if (p.second < min_freq) min_freq = p.second;
+            }
+            // Among items with min frequency, evict the one with earliest insertion order
+            uint32_t earliest_order = UINT32_MAX;
+            for (const auto& p : freq) {
+                if (p.second == min_freq && order[p.first] < earliest_order) {
+                    vic = p.first;
+                    earliest_order = order[p.first];
+                }
+            }
+            freq.erase(vic);
+            order.erase(vic);
+            ev = true;
+        }
+        freq[k] = 1;
+        order[k] = counter++;
+        return {ev, vic};
+    }
+    void touch(uint32_t k) { access(k); }
+private:
+    size_t cap;
+    unordered_map<uint32_t, int> freq;
+    unordered_map<uint32_t, uint32_t> order;
+    uint32_t counter;
+};
+
+} // namespace policy
+
+
+/* ───────────────────── Generic VM simulator ───────────────────── */
+
+template<typename Policy>
+class BasicSimulator {
+public:
+    BasicSimulator(int nframes, int tlbsz)
+        : pt(1 << LEVEL1_BITS, vector<PageTableEntry>(1 << LEVEL2_BITS))
+        , tlb(tlbsz)
+        , frame(nframes)
+        , frames(nframes, UINT32_MAX) {}
+
+    void access_memory(uint32_t vaddr)
+    {
+        ++refs;
+        uint32_t vpn = vaddr >> PAGE_OFFSET_BITS;
+        uint32_t off = vaddr & OFFSET_MASK;
+        uint32_t l1  = (vpn >> LEVEL2_BITS) & LEVEL1_MASK;
+        uint32_t l2  =  vpn & LEVEL2_MASK;
+
+        bool tlb_hit = tlb.access(vpn);
+        uint32_t pfn = 0; bool pg = false; bool ev = false; uint32_t vic = 0;
+
+        if (tlb_hit) {
+            ++tlb_hits; pfn = tlb_map[vpn]; tlb.touch(vpn); frame.touch(vpn);
+        } else {
+            ++tlb_miss;
+            if (!pt[l1][l2].valid) {
+                pg = true; ++page_faults;
+                size_t f = find_free_frame();
+                if (f == SIZE_MAX) {
+                    auto [e, v] = frame.insert(vpn); ev = e; vic = v; f = vpn2frame[v];
+                    invalidate(v);
+                } else {
+                    frame.insert(vpn);
+                }
+                occupy(f, vpn);
+                pt[l1][l2] = {static_cast<uint32_t>(f), true};
+                pfn = static_cast<uint32_t>(f);
+            } else {
+                pfn = pt[l1][l2].ppn; frame.touch(vpn);
+            }
+            auto [tev, oldvpn] = tlb.insert(vpn);
+            if (tev) tlb_map.erase(oldvpn);
+            tlb_map[vpn] = pfn;
+        }
+
+        uint32_t paddr = (pfn << PAGE_OFFSET_BITS) | off;
+        print_hex32(vaddr); cout << " -> "; print_hex32(paddr);
+        cout << ", TLB " << (tlb_hit ? "hit" : "miss")
+             << ", "      << (pg ? "Page fault" : "No page fault");
+        if (ev) { cout << ", Evicted "; print_hex32(vic << PAGE_OFFSET_BITS); }
+        cout << '\n' << dec;
+    }
+
+    void print_statistics() const
+    {
+        cout << "Total references: " << refs << '\n'
+             << "TLB hits: "        << tlb_hits << '\n'
+             << "TLB misses: "      << tlb_miss << '\n'
+             << "TLB hit ratio: "   << fixed << setprecision(1)
+             << (refs ? tlb_hits * 100.0 / refs : 0.0) << "%\n"
+             << "Page faults: "     << page_faults << '\n'
+             << "Page fault rate: " << fixed << setprecision(1)
+             << (refs ? page_faults * 100.0 / refs : 0.0) << "%\n";
+    }
+
+private:
+    /* helpers */
+    size_t find_free_frame() const {
+        for (size_t i = 0; i < frames.size(); ++i)
+            if (frames[i] == UINT32_MAX) return i;
+        return SIZE_MAX;
+    }
+    void occupy(size_t f, uint32_t vpn) {
+        frames[f] = vpn; vpn2frame[vpn] = static_cast<uint32_t>(f);
+    }
+    void invalidate(uint32_t victim) {
+        size_t f = vpn2frame[victim]; frames[f] = UINT32_MAX; vpn2frame.erase(victim);
+        uint32_t e1 = (victim >> LEVEL2_BITS) & LEVEL1_MASK;
+        uint32_t e2 =  victim & LEVEL2_MASK;
+        pt[e1][e2].valid = false; tlb_map.erase(victim);
+    }
+
+    /* structures */
+    vector<vector<PageTableEntry>> pt;
+    Policy tlb, frame;
+    unordered_map<uint32_t, uint32_t> tlb_map, vpn2frame;
+    vector<uint32_t> frames;
+
+    /* stats */
+    uint64_t refs = 0, tlb_hits = 0, tlb_miss = 0, page_faults = 0;
+};
+
+using FIFOSim = BasicSimulator<policy::FIFO>;
+using LRUSim  = BasicSimulator<policy::LRU>;
+using LFUSim  = BasicSimulator<policy::LFU>;
+
+/* -----------------------------------------------------------------------------
+ *                                   main
+ * -------------------------------------------------------------------------- */
+int main(int argc, char *argv[])
+{
     if (argc != 4) {
-        cerr << "Usage: " << argv[0] << " <num_frames> <tlb_size> <algorithm>" << endl;
+        cerr << "Usage: " << argv[0] << " <num_frames> <tlb_size> <FIFO|LRU|LFU>\n";
         return 1;
     }
-    
-    int num_frames = stoi(argv[1]);
-    int tlb_size = stoi(argv[2]);
-    string algorithm = argv[3];
-    
-    if (algorithm != "S3FIFO") {
-        cerr << "Only S3FIFO algorithm is supported" << endl;
+
+    int nframes = stoi(argv[1]);
+    int tlbsz   = stoi(argv[2]);
+    string alg  = argv[3];
+    transform(alg.begin(), alg.end(), alg.begin(), ::toupper);
+
+    if (alg == "S3FIFO") {
+        VMSimulator simulator(nframes, tlbsz);
+        
+        string line;
+        while (getline(cin, line)) {
+            uint32_t vaddr = stoul(line, nullptr, 16);
+            simulator.access_memory(vaddr);
+        }
+        
+        simulator.print_statistics();
+    } else if (alg == "FIFO") {
+        FIFOSim sim(nframes, tlbsz); string line;
+        while (getline(cin, line)) if (!line.empty()) sim.access_memory(static_cast<uint32_t>(stoul(line, nullptr, 16)));
+        sim.print_statistics();
+    } else if (alg == "LRU") {
+        LRUSim sim(nframes, tlbsz); string line;
+        while (getline(cin, line)) if (!line.empty()) sim.access_memory(static_cast<uint32_t>(stoul(line, nullptr, 16)));
+        sim.print_statistics();
+    } else if (alg == "LFU") {
+        LFUSim sim(nframes, tlbsz); string line;
+        while (getline(cin, line)) if (!line.empty()) sim.access_memory(static_cast<uint32_t>(stoul(line, nullptr, 16)));
+        sim.print_statistics();
+    } else {
+        cerr << "Unsupported algorithm: " << alg << '\n';
         return 1;
     }
-    
-    VMSimulator simulator(num_frames, tlb_size);
-    
-    string line;
-    while (getline(cin, line)) {
-        uint32_t vaddr = stoul(line, nullptr, 16);
-        simulator.access_memory(vaddr);
-    }
-    
-    simulator.print_statistics();
-    
     return 0;
 }
